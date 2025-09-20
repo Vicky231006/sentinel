@@ -1,0 +1,9 @@
+
+data/*.h5              # Your model files (too large)
+data/*.pkl             # Scaler files  
+test_files/*.wav       # Test audio files
+test_files/*.mp4       # Test video files
+.venv/                 # Virtual environment
+__pycache__/           # Python cache
+*.log                  # Log files
+.env                   # Environment variables

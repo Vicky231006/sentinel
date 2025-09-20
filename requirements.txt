@@ -1,5 +1,11 @@
+fastapi
+uvicorn
 tensorflow
-opencv-python
+tensorflow-hub
+librosa
+scikit-learn
 numpy
-streamlit
-shap
+python-multipart
+websockets
+ffmpeg-python
+pathlib
