@@ -52,7 +52,7 @@ class DeepfakeDetector:
         self.scaler = None
         self.sample_rate = 16000
         self.is_loaded = False
-        self.prediction_threshold = 0.75  # Higher threshold to reduce false positives
+        self.prediction_threshold = 0.65  # Balanced threshold
         
         # Load models on initialization
         self.load_models()
@@ -120,7 +120,7 @@ class DeepfakeDetector:
             return None
     
     def predict(self, audio_data: np.ndarray, sr: int) -> Dict[str, Any]:
-        """Predict if audio is real or fake with bias correction"""
+        """Predict if audio is real or fake with balanced correction"""
         if not self.is_loaded:
             return {"error": "Models not loaded"}
 
@@ -132,21 +132,38 @@ class DeepfakeDetector:
             features_scaled = self.scaler.transform([features])
             prediction_prob = self.classifier.predict(features_scaled)[0][0]
 
-            # BIAS CORRECTION: Apply probability calibration and higher threshold
-            # Original range [0,1] mapped to [0.3, 0.7] to reduce extreme predictions
-            calibrated_prob = 0.3 + 0.4 * prediction_prob
+            # BALANCED APPROACH: Less aggressive calibration
+            # Apply sigmoid-like calibration to reduce extreme values while preserving discrimination
+            if prediction_prob > 0.8:
+                # Reduce very high fake predictions slightly
+                calibrated_prob = 0.6 + 0.2 * ((prediction_prob - 0.8) / 0.2)
+            elif prediction_prob < 0.2:
+                # Boost very low fake predictions slightly  
+                calibrated_prob = 0.2 * (prediction_prob / 0.2)
+            else:
+                # Keep middle range mostly unchanged
+                calibrated_prob = 0.2 + 0.6 * ((prediction_prob - 0.2) / 0.6)
             
-            # Use higher threshold to reduce false positives (real voices being labeled as fake)
-            prediction = "FAKE" if calibrated_prob > self.prediction_threshold else "REAL"
+            # Use moderate threshold
+            threshold = 0.65  # Balanced threshold
+            prediction = "FAKE" if calibrated_prob > threshold else "REAL"
             confidence = calibrated_prob if prediction == "FAKE" else (1 - calibrated_prob)
+
+            # Additional check: if original probability is very extreme, be more conservative
+            if prediction_prob > 0.95:
+                prediction = "FAKE"
+                confidence = 0.9
+            elif prediction_prob < 0.05:
+                prediction = "REAL"
+                confidence = 0.9
 
             return {
                 "prediction": prediction,
                 "confidence": float(confidence),
                 "probability": float(prediction_prob),
                 "calibrated_probability": float(calibrated_prob),
-                "threshold_used": self.prediction_threshold,
-                "bias_correction_applied": True,
+                "threshold_used": threshold,
+                "calibration_applied": True,
                 "timestamp": datetime.now().isoformat()
             }
 
