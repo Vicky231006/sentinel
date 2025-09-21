@@ -1,4 +1,4 @@
-# FastAPI Deepfake Detection Service with WebSocket Support
+# FastAPI Deepfake Detection Service - Fixed Version
 # Handles audio extraction from video files and real-time detection
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
@@ -17,10 +17,11 @@ import base64
 from typing import Dict, Any
 import logging
 from datetime import datetime
-import ffmpeg
+import subprocess
 import io
 from pathlib import Path
 import uuid
+import shutil
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="YamNet Deepfake Voice Detection API",
     description="Real-time deepfake voice detection using YamNet",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # Add CORS middleware
@@ -52,7 +53,6 @@ class DeepfakeDetector:
         self.scaler = None
         self.sample_rate = 16000
         self.is_loaded = False
-        self.prediction_threshold = 0.65  # Balanced threshold
         
         # Load models on initialization
         self.load_models()
@@ -119,8 +119,8 @@ class DeepfakeDetector:
             logger.error(f"Feature extraction error: {e}")
             return None
     
-    def predict(self, audio_data: np.ndarray, sr: int) -> Dict[str, Any]:
-        """Predict if audio is real or fake with balanced correction"""
+    def predict_raw(self, audio_data: np.ndarray, sr: int) -> Dict[str, Any]:
+        """Get raw prediction without any bias correction"""
         if not self.is_loaded:
             return {"error": "Models not loaded"}
 
@@ -131,50 +131,58 @@ class DeepfakeDetector:
 
             features_scaled = self.scaler.transform([features])
             prediction_prob = self.classifier.predict(features_scaled)[0][0]
-
-            # BALANCED APPROACH: Less aggressive calibration
-            # Apply sigmoid-like calibration to reduce extreme values while preserving discrimination
-            if prediction_prob > 0.8:
-                # Reduce very high fake predictions slightly
-                calibrated_prob = 0.6 + 0.2 * ((prediction_prob - 0.8) / 0.2)
-            elif prediction_prob < 0.2:
-                # Boost very low fake predictions slightly  
-                calibrated_prob = 0.2 * (prediction_prob / 0.2)
-            else:
-                # Keep middle range mostly unchanged
-                calibrated_prob = 0.2 + 0.6 * ((prediction_prob - 0.2) / 0.6)
             
-            # Use moderate threshold
-            threshold = 0.65  # Balanced threshold
-            prediction = "FAKE" if calibrated_prob > threshold else "REAL"
-            confidence = calibrated_prob if prediction == "FAKE" else (1 - calibrated_prob)
-
-            # Additional check: if original probability is very extreme, be more conservative
-            if prediction_prob > 0.95:
-                prediction = "FAKE"
-                confidence = 0.9
-            elif prediction_prob < 0.05:
-                prediction = "REAL"
-                confidence = 0.9
-
             return {
-                "prediction": prediction,
-                "confidence": float(confidence),
-                "probability": float(prediction_prob),
-                "calibrated_probability": float(calibrated_prob),
-                "threshold_used": threshold,
-                "calibration_applied": True,
+                "raw_probability": float(prediction_prob),
+                "features_shape": features.shape,
+                "model_output": "raw"
+            }
+
+        except Exception as e:
+            logger.error(f"Raw prediction error: {e}")
+            return {"error": str(e)}
+    
+    def predict(self, audio_data: np.ndarray, sr: int) -> Dict[str, Any]:
+        """Predict with multiple threshold testing"""
+        if not self.is_loaded:
+            return {"error": "Models not loaded"}
+
+        try:
+            features = self.extract_yamnet_features(audio_data, sr)
+            if features is None:
+                return {"error": "Could not extract features"}
+
+            features_scaled = self.scaler.transform([features])
+            raw_prob = self.classifier.predict(features_scaled)[0][0]
+            
+            # Test multiple thresholds and provide all results
+            thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+            threshold_results = {}
+            
+            for thresh in thresholds:
+                prediction = "FAKE" if raw_prob > thresh else "REAL"
+                confidence = raw_prob if prediction == "FAKE" else (1 - raw_prob)
+                threshold_results[f"threshold_{thresh}"] = {
+                    "prediction": prediction,
+                    "confidence": float(confidence)
+                }
+            
+            # Use 0.5 as default but provide all options
+            default_prediction = "FAKE" if raw_prob > 0.5 else "REAL"
+            default_confidence = raw_prob if default_prediction == "FAKE" else (1 - raw_prob)
+            
+            return {
+                "prediction": default_prediction,
+                "confidence": float(default_confidence),
+                "raw_probability": float(raw_prob),
+                "threshold_results": threshold_results,
+                "recommendation": "Use threshold_results to find best threshold for your use case",
                 "timestamp": datetime.now().isoformat()
             }
 
         except Exception as e:
             logger.error(f"Prediction error: {e}")
             return {"error": str(e)}
-    
-    def set_threshold(self, threshold: float):
-        """Allow dynamic threshold adjustment"""
-        self.prediction_threshold = max(0.1, min(0.9, threshold))
-        logger.info(f"Prediction threshold set to {self.prediction_threshold}")
 
 # Global detector instance
 detector = DeepfakeDetector()
@@ -183,36 +191,74 @@ class AudioExtractor:
     """Handle audio extraction from various file formats"""
     
     @staticmethod
-    def extract_audio_from_video(video_path: str, output_path: str = None) -> str:
-        """Extract audio from video file using ffmpeg"""
+    def extract_audio_from_video_subprocess(video_path: str) -> str:
+        """Extract audio using subprocess (more reliable than ffmpeg-python)"""
         try:
-            if output_path is None:
-                output_path = video_path.replace(Path(video_path).suffix, '.wav')
+            output_path = video_path.replace(Path(video_path).suffix, '.wav')
             
-            # Extract audio using ffmpeg-python
-            (
-                ffmpeg
-                .input(video_path)
-                .output(output_path, acodec='pcm_s16le', ac=1, ar=16000)
-                .overwrite_output()
-                .run(quiet=True)
-            )
+            # Use subprocess to call ffmpeg directly
+            cmd = [
+                'ffmpeg',
+                '-i', video_path,
+                '-vn',  # No video
+                '-acodec', 'pcm_s16le',  # 16-bit PCM
+                '-ac', '1',  # Mono
+                '-ar', '16000',  # 16kHz sample rate
+                '-y',  # Overwrite output
+                output_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
+            if result.returncode != 0:
+                logger.error(f"FFmpeg error: {result.stderr}")
+                raise Exception(f"FFmpeg failed: {result.stderr}")
+            
+            if not os.path.exists(output_path):
+                raise Exception("Audio extraction failed - output file not created")
+                
+            return output_path
+            
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=400, detail="Video processing timeout")
+        except FileNotFoundError:
+            raise HTTPException(status_code=500, detail="FFmpeg not installed on server")
+        except Exception as e:
+            logger.error(f"Audio extraction error: {e}")
+            raise HTTPException(status_code=400, detail=f"Audio extraction failed: {str(e)}")
+    
+    @staticmethod
+    def extract_audio_fallback(video_path: str) -> str:
+        """Fallback method using librosa directly"""
+        try:
+            # Try to load video file directly with librosa
+            audio_data, sr = librosa.load(video_path, sr=16000)
+            
+            # Save as WAV
+            output_path = video_path.replace(Path(video_path).suffix, '.wav')
+            import soundfile as sf
+            sf.write(output_path, audio_data, sr)
             
             return output_path
             
         except Exception as e:
-            logger.error(f"Audio extraction error: {e}")
-            raise HTTPException(status_code=400, detail=f"Audio extraction failed: {e}")
+            logger.error(f"Fallback extraction error: {e}")
+            raise HTTPException(status_code=400, detail=f"Could not extract audio: {str(e)}")
     
     @staticmethod
     def load_audio_file(file_path: str) -> tuple:
         """Load audio file and return data with sample rate"""
         try:
             audio_data, sr = librosa.load(file_path, sr=None)
+            
+            # Ensure we have audio data
+            if len(audio_data) == 0:
+                raise Exception("Empty audio file")
+            
             return audio_data, sr
         except Exception as e:
             logger.error(f"Audio loading error: {e}")
-            raise HTTPException(status_code=400, detail=f"Audio loading failed: {e}")
+            raise HTTPException(status_code=400, detail=f"Audio loading failed: {str(e)}")
 
 # WebSocket connection manager
 class ConnectionManager:
@@ -241,11 +287,15 @@ manager = ConnectionManager()
 async def root():
     """Root endpoint"""
     return {
-        "message": "YamNet Deepfake Voice Detection API",
-        "version": "1.0.0",
+        "message": "YamNet Deepfake Voice Detection API - Fixed Version",
+        "version": "2.0.0",
         "model_loaded": detector.is_loaded,
-        "bias_correction_enabled": True,
-        "current_threshold": detector.prediction_threshold
+        "features": [
+            "Fixed MP4 processing",
+            "Multiple threshold testing", 
+            "Raw probability output",
+            "Improved error handling"
+        ]
     }
 
 @app.get("/health")
@@ -254,8 +304,7 @@ async def health_check():
     return {
         "status": "healthy",
         "model_loaded": detector.is_loaded,
-        "bias_correction": True,
-        "threshold": detector.prediction_threshold,
+        "ffmpeg_available": shutil.which('ffmpeg') is not None,
         "timestamp": datetime.now().isoformat()
     }
 
@@ -275,25 +324,39 @@ async def predict_uploaded_file(file: UploadFile = File(...)):
             content = await file.read()
             buffer.write(content)
         
+        logger.info(f"Processing file: {file.filename}, size: {len(content)} bytes")
+        
         # Determine file type and process accordingly
         file_extension = Path(file.filename).suffix.lower()
         
-        if file_extension in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv']:
+        if file_extension in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']:
             # Video file - extract audio first
-            audio_path = AudioExtractor.extract_audio_from_video(temp_file_path)
+            try:
+                # Try subprocess method first
+                audio_path = AudioExtractor.extract_audio_from_video_subprocess(temp_file_path)
+            except:
+                # Fallback to librosa
+                logger.info("Trying fallback audio extraction method")
+                audio_path = AudioExtractor.extract_audio_fallback(temp_file_path)
+            
             audio_data, sr = AudioExtractor.load_audio_file(audio_path)
+            
         elif file_extension in ['.wav', '.mp3', '.flac', '.m4a', '.ogg']:
             # Audio file - load directly
             audio_data, sr = AudioExtractor.load_audio_file(temp_file_path)
         else:
-            raise HTTPException(status_code=400, detail="Unsupported file format")
+            raise HTTPException(status_code=400, detail=f"Unsupported file format: {file_extension}")
         
-        # Make prediction using the bias-corrected method
+        logger.info(f"Audio loaded: {len(audio_data)} samples at {sr}Hz")
+        
+        # Make prediction
         result = detector.predict(audio_data, sr)
         
         return {
             "filename": file.filename,
             "file_type": file_extension,
+            "audio_duration": len(audio_data) / sr,
+            "sample_rate": sr,
             "result": result
         }
     
@@ -303,7 +366,53 @@ async def predict_uploaded_file(file: UploadFile = File(...)):
     
     finally:
         # Cleanup temporary files
-        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+@app.post("/predict/raw")
+async def predict_raw_probability(file: UploadFile = File(...)):
+    """Get raw model probability without any processing"""
+    if not detector.is_loaded:
+        raise HTTPException(status_code=503, detail="Models not loaded")
+    
+    temp_dir = tempfile.mkdtemp()
+    temp_file_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{file.filename}")
+    
+    try:
+        with open(temp_file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        file_extension = Path(file.filename).suffix.lower()
+        
+        if file_extension in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']:
+            try:
+                audio_path = AudioExtractor.extract_audio_from_video_subprocess(temp_file_path)
+            except:
+                audio_path = AudioExtractor.extract_audio_fallback(temp_file_path)
+            audio_data, sr = AudioExtractor.load_audio_file(audio_path)
+        else:
+            audio_data, sr = AudioExtractor.load_audio_file(temp_file_path)
+        
+        # Get raw prediction
+        result = detector.predict_raw(audio_data, sr)
+        
+        return {
+            "filename": file.filename,
+            "raw_result": result,
+            "interpretation": {
+                "0.0-0.2": "Very likely REAL",
+                "0.2-0.4": "Probably REAL", 
+                "0.4-0.6": "Uncertain",
+                "0.6-0.8": "Probably FAKE",
+                "0.8-1.0": "Very likely FAKE"
+            }
+        }
+    
+    except Exception as e:
+        logger.error(f"Raw prediction error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 @app.websocket("/ws")
@@ -313,35 +422,26 @@ async def websocket_endpoint(websocket: WebSocket):
     
     try:
         while True:
-            # Receive data from client
             data = await websocket.receive_text()
             
             try:
                 message = json.loads(data)
                 
                 if message["type"] == "audio_data":
-                    # Handle base64 encoded audio data
                     audio_b64 = message["data"]
                     sample_rate = message.get("sample_rate", 16000)
                     
-                    # Decode base64 audio data
                     audio_bytes = base64.b64decode(audio_b64)
-                    
-                    # Convert bytes to numpy array
-                    # This assumes the audio is sent as float32 array
                     audio_data = np.frombuffer(audio_bytes, dtype=np.float32)
                     
-                    # Make prediction
                     result = detector.predict(audio_data, sample_rate)
                     
-                    # Send result back
                     await manager.send_personal_message({
                         "type": "prediction_result",
                         "result": result
                     }, websocket)
                 
                 elif message["type"] == "ping":
-                    # Handle ping/pong for connection health
                     await manager.send_personal_message({
                         "type": "pong",
                         "timestamp": datetime.now().isoformat()
@@ -391,39 +491,7 @@ async def model_status():
         "yamnet_loaded": detector.yamnet_model is not None,
         "classifier_loaded": detector.classifier is not None,
         "scaler_loaded": detector.scaler is not None,
-        "bias_correction_enabled": True,
-        "current_threshold": detector.prediction_threshold
-    }
-
-@app.post("/config/threshold")
-async def set_prediction_threshold(threshold: float):
-    """Endpoint to adjust prediction threshold"""
-    if not detector.is_loaded:
-        raise HTTPException(status_code=503, detail="Models not loaded")
-    
-    if not 0.1 <= threshold <= 0.9:
-        raise HTTPException(status_code=400, detail="Threshold must be between 0.1 and 0.9")
-    
-    detector.set_threshold(threshold)
-    return {
-        "success": True,
-        "new_threshold": detector.prediction_threshold,
-        "message": f"Threshold set to {detector.prediction_threshold}"
-    }
-
-@app.get("/debug/model_info")
-async def debug_model_info():
-    """Debug endpoint to get model information"""
-    if not detector.is_loaded:
-        return {"error": "Models not loaded"}
-    
-    return {
-        "model_loaded": detector.is_loaded,
-        "threshold": detector.prediction_threshold,
-        "bias_correction": True,
-        "calibration_range": "[0.3, 0.7]",
-        "recommendation": "Use threshold 0.75-0.8 for balanced detection",
-        "timestamp": datetime.now().isoformat()
+        "ffmpeg_available": shutil.which('ffmpeg') is not None
     }
 
 if __name__ == "__main__":
